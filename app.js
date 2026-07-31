@@ -28,6 +28,7 @@ const logger = pino(opts, pino.destination({sync: false}));
 const {LifeCycleEvents, FS_UUID_SET_NAME, SystemState, FEATURE_SERVER} = require('./lib/utils/constants');
 const installSrfLocals = require('./lib/utils/install-srf-locals');
 const {registerActiveFs, unregisterActiveFs} = require('./lib/utils/active-fs-registration');
+const {registerFsServiceUrl, unregisterFsServiceUrl} = require('./lib/utils/fs-service-url-registration');
 const createHttpListener = require('./lib/utils/http-listener');
 const healthCheck = require('@jambonz/http-health-check');
 const ProcessMonitor = require('./lib/utils/process-monitor');
@@ -74,6 +75,16 @@ installSrfLocals(srf, logger, {
       .then(({server, app}) => {
         httpServer = server;
         healthCheck({app, logger, path: '/', fn: getCount});
+
+        /* announce our HTTP service url to api-server, which selects a feature
+           server from `${JAMBONES_CLUSTER_ID}:fs-service-url` for REST-originated
+           calls (POST /v1/Accounts/:sid/Calls) and for messaging, and 480s with
+           "no available feature servers at this time" if it is empty. This has
+           to happen HERE and not in srf.on('connect') like active-fs:
+           srf.locals.serviceUrl does not exist until this listener has bound.
+           Not under kubernetes: api-server's getFsUrl() short-circuits to
+           K8S_FEATURE_SERVER_SERVICE_NAME and never reads the set. */
+        if (!K8S) registerFsServiceUrl(srf, logger, {clusterId: JAMBONES_CLUSTER_ID});
         return {server, app};
       })
       .catch((err) => {
@@ -177,6 +188,10 @@ const disconnect = async() => {
      otherwise the refresh timer keeps us selectable with no media server behind us.
      A later freeswitch reconnect re-runs srf.connect() and re-registers us. */
   await unregisterActiveFs(srf, logger, {clusterId: JAMBONES_CLUSTER_ID});
+  /* same reasoning for the REST/messaging advertisement: with no media server
+     behind us an api-server dial routed here would fail. A later freeswitch
+     reconnect re-runs createHttpListener() and re-registers us. */
+  await unregisterFsServiceUrl(srf, logger, {clusterId: JAMBONES_CLUSTER_ID});
   return new Promise ((resolve) => {
     httpServer?.on('close', resolve);
     httpServer?.close();
@@ -204,20 +219,21 @@ async function handle(signal) {
       }
     });
   }
-  const fsServiceUrlSetName = `${(JAMBONES_CLUSTER_ID || 'default')}:fs-service-url`;
-  /* stop the active-fs refresh AND deregister, in that order -- otherwise the
-     refresh timer would re-add us while we are draining in-progress calls.
+  /* stop the refresh timers AND deregister, in that order -- otherwise a
+     refresh would re-add us while we are draining in-progress calls.
      Every removal below is awaited: with no calls in progress we call
      process.exit(0) a few lines down, which would otherwise beat the redis write. */
   await unregisterActiveFs(srf, logger, {clusterId: JAMBONES_CLUSTER_ID});
+  /* was an inline removeFromSet() against a set nothing ever wrote -- the
+     removal half of a lifecycle whose registration half was missing. Now
+     symmetric with registerFsServiceUrl(), and it removes only what we actually
+     advertised rather than recomputing srf.locals.serviceUrl (which can have
+     changed since, and is non-null even when registration was skipped). */
+  await unregisterFsServiceUrl(srf, logger, {clusterId: JAMBONES_CLUSTER_ID});
   try {
-    if (fsServiceUrlSetName && srf.locals.serviceUrl) {
-      logger.info(`got signal ${signal}, removing ${srf.locals.serviceUrl} from set ${fsServiceUrlSetName}`);
-      await removeFromSet(fsServiceUrlSetName, srf.locals.serviceUrl);
-    }
     if (srf.locals.fsUUID) await removeFromSet(FS_UUID_SET_NAME, srf.locals.fsUUID);
   } catch (err) {
-    logger.info({err}, 'Error deregistering from redis on shutdown');
+    logger.info({err}, 'Error deregistering from redis on teardown');
   }
   if (K8S) {
     srf.locals.lifecycleEmitter.operationalState = LifeCycleEvents.ScaleIn;

@@ -5,6 +5,7 @@ require('./http-requestor-retry-test');
 require('./http-requestor-unit-test');
 require('./unit-tests');
 require('./active-fs-registration-test');
+require('./fs-service-url-registration-test');
 require('./shutdown-signal-test');
 require('./drain-signal-test');
 require('./openai-s2s-ordering-test');
