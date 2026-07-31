@@ -58,8 +58,11 @@ installSrfLocals(srf, logger, {
         logger.info(`connected to drachtio listening on ${hp}, local sip address is ${srf.locals.localSipAddress}`);
 
         /* announce ourselves to sbc-inbound, which selects a feature server
-           from `${JAMBONES_CLUSTER_ID}:active-fs` and 480s the call if it is empty */
-        registerActiveFs(srf, logger, {clusterId: JAMBONES_CLUSTER_ID});
+           from `${JAMBONES_CLUSTER_ID}:active-fs` and 480s the call if it is empty.
+           Not under kubernetes: there sbc-inbound short-circuits to
+           K8S_FEATURE_SERVER_SERVICE_NAME and never reads the set, so a member
+           written here would only be a stray key nobody removes. */
+        if (!K8S) registerActiveFs(srf, logger, {clusterId: JAMBONES_CLUSTER_ID});
       });
     }
     else {
@@ -168,7 +171,12 @@ const monInterval = setInterval(async() => {
   }
 }, 20000);
 
-const disconnect = () => {
+const disconnect = async() => {
+  /* we can no longer handle calls (this is called when every freeswitch connection
+     is gone), so stop advertising ourselves to sbc-inbound before tearing down --
+     otherwise the refresh timer keeps us selectable with no media server behind us.
+     A later freeswitch reconnect re-runs srf.connect() and re-registers us. */
+  await unregisterActiveFs(srf, logger, {clusterId: JAMBONES_CLUSTER_ID});
   return new Promise ((resolve) => {
     httpServer?.on('close', resolve);
     httpServer?.close();
@@ -198,13 +206,19 @@ async function handle(signal) {
   }
   const fsServiceUrlSetName = `${(JAMBONES_CLUSTER_ID || 'default')}:fs-service-url`;
   /* stop the active-fs refresh AND deregister, in that order -- otherwise the
-     refresh timer would re-add us while we are draining in-progress calls */
-  unregisterActiveFs(srf, logger, {clusterId: JAMBONES_CLUSTER_ID});
-  if (fsServiceUrlSetName && srf.locals.serviceUrl) {
-    logger.info(`got signal ${signal}, removing ${srf.locals.serviceUrl} from set ${fsServiceUrlSetName}`);
-    removeFromSet(fsServiceUrlSetName, srf.locals.serviceUrl);
+     refresh timer would re-add us while we are draining in-progress calls.
+     Every removal below is awaited: with no calls in progress we call
+     process.exit(0) a few lines down, which would otherwise beat the redis write. */
+  await unregisterActiveFs(srf, logger, {clusterId: JAMBONES_CLUSTER_ID});
+  try {
+    if (fsServiceUrlSetName && srf.locals.serviceUrl) {
+      logger.info(`got signal ${signal}, removing ${srf.locals.serviceUrl} from set ${fsServiceUrlSetName}`);
+      await removeFromSet(fsServiceUrlSetName, srf.locals.serviceUrl);
+    }
+    if (srf.locals.fsUUID) await removeFromSet(FS_UUID_SET_NAME, srf.locals.fsUUID);
+  } catch (err) {
+    logger.info({err}, 'Error deregistering from redis on shutdown');
   }
-  removeFromSet(FS_UUID_SET_NAME, srf.locals.fsUUID);
   if (K8S) {
     srf.locals.lifecycleEmitter.operationalState = LifeCycleEvents.ScaleIn;
   }

@@ -8,22 +8,34 @@ const {
 const noop = () => {};
 const logger = {error: noop, info: noop, debug: noop, warn: noop};
 
-const makeSrf = (localSipAddress) => {
+/**
+ * @param {string} localSipAddress
+ * @param {number} [writeDelayMs] - how long redis takes to acknowledge a write;
+ *   non-zero exposes callers that do not wait for the write to land
+ */
+const makeSrf = (localSipAddress, writeDelayMs = 0) => {
   const added = [];
   const removed = [];
+  /* the set as redis would actually hold it, so ordering bugs are visible */
+  const members = new Set();
+  const settle = (fn) => new Promise((resolve) => {
+    if (!writeDelayMs) return (fn(), resolve(1));
+    setTimeout(() => (fn(), resolve(1)), writeDelayMs);
+  });
   return {
     added,
     removed,
+    members,
     locals: {
       localSipAddress,
       dbHelpers: {
         addToSet: (setName, member) => {
           added.push(`${setName}|${member}`);
-          return Promise.resolve(1);
+          return settle(() => members.add(member));
         },
         removeFromSet: (setName, member) => {
           removed.push(`${setName}|${member}`);
-          return Promise.resolve(1);
+          return settle(() => members.delete(member));
         }
       }
     }
@@ -83,16 +95,60 @@ test('registerActiveFs is a no-op when we have no sip address yet', (t) => {
   t.end();
 });
 
-test('unregisterActiveFs removes us and stops the refresh (so a drain stays drained)', (t) => {
+test('unregisterActiveFs removes us and stops the refresh (so a drain stays drained)', async(t) => {
   const srf = makeSrf('127.0.0.1:5070');
   registerActiveFs(srf, logger, {clusterId: 'default', refreshMs: 20});
   const afterRegister = srf.added.length;
 
-  unregisterActiveFs(srf, logger, {clusterId: 'default'});
+  await unregisterActiveFs(srf, logger, {clusterId: 'default'});
   t.deepEqual(srf.removed, ['default:active-fs|127.0.0.1:5070'], 'removed from the set');
 
-  setTimeout(() => {
-    t.equal(srf.added.length, afterRegister, 'refresh timer stopped, we were not re-added while draining');
-    t.end();
-  }, 80);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  t.equal(srf.added.length, afterRegister, 'refresh timer stopped, we were not re-added while draining');
+  t.end();
+});
+
+test('unregisterActiveFs resolves only once redis has acknowledged the removal', async(t) => {
+  /* shutdown calls process.exit(0) the moment this returns; a fire-and-forget SREM
+     loses that race and the dead feature server stays selectable by sbc-inbound */
+  const srf = makeSrf('127.0.0.1:5070', 60);
+  registerActiveFs(srf, logger, {clusterId: 'default', refreshMs: 10000});
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  t.deepEqual([...srf.members], ['127.0.0.1:5070'], 'we are in the set to begin with');
+
+  const p = unregisterActiveFs(srf, logger, {clusterId: 'default'});
+  t.ok(p && typeof p.then === 'function', 'unregisterActiveFs returns a promise to wait on');
+  t.deepEqual([...srf.members], ['127.0.0.1:5070'], 'redis has not acknowledged yet');
+
+  await p;
+  t.deepEqual([...srf.members], [], 'awaiting it guarantees the removal landed');
+  t.end();
+});
+
+test('unregisterActiveFs removes nothing when we never registered', async(t) => {
+  /* under kubernetes we skip registration entirely; shutdown must not SREM an
+     address we never advertised */
+  const srf = makeSrf('127.0.0.1:5070');
+
+  await unregisterActiveFs(srf, logger, {clusterId: 'default'});
+  t.deepEqual(srf.removed, [], 'no spurious removal');
+  t.end();
+});
+
+test('a drachtio reconnect on a changed address drops the address we advertised before', async(t) => {
+  /* set members carry no TTL: an address left behind here stays selectable for
+     ever, and some calls route to it indefinitely */
+  const srf = makeSrf('10.0.0.1:5070');
+  registerActiveFs(srf, logger, {clusterId: 'default', refreshMs: 10000});
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  srf.locals.localSipAddress = '10.0.0.2:5070';
+  registerActiveFs(srf, logger, {clusterId: 'default', refreshMs: 10000});
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  t.deepEqual([...srf.members], ['10.0.0.2:5070'], 'only the current address is in the set');
+  t.deepEqual(srf.removed, ['default:active-fs|10.0.0.1:5070'], 'the previous address was removed');
+
+  clearInterval(srf.locals.activeFsRefreshTimer);
+  t.end();
 });

@@ -5,6 +5,8 @@ require('./http-requestor-retry-test');
 require('./http-requestor-unit-test');
 require('./unit-tests');
 require('./active-fs-registration-test');
+require('./shutdown-signal-test');
+require('./drain-signal-test');
 require('./openai-s2s-ordering-test');
 require('./hold-unhold-test');
 require('./docker_start');
