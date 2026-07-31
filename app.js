@@ -27,6 +27,7 @@ const pino = require('pino');
 const logger = pino(opts, pino.destination({sync: false}));
 const {LifeCycleEvents, FS_UUID_SET_NAME, SystemState, FEATURE_SERVER} = require('./lib/utils/constants');
 const installSrfLocals = require('./lib/utils/install-srf-locals');
+const {registerActiveFs, unregisterActiveFs} = require('./lib/utils/active-fs-registration');
 const createHttpListener = require('./lib/utils/http-listener');
 const healthCheck = require('@jambonz/http-health-check');
 const ProcessMonitor = require('./lib/utils/process-monitor');
@@ -51,9 +52,14 @@ installSrfLocals(srf, logger, {
     if (DRACHTIO_HOST) {
       srf.connect({host: DRACHTIO_HOST, port: DRACHTIO_PORT, secret: DRACHTIO_SECRET });
       srf.on('connect', (err, hp) => {
+        if (err) return logger.error({err}, 'Error connecting to drachtio server');
         const arr = /^(.*)\/(.*)$/.exec(hp.split(',').pop());
         srf.locals.localSipAddress = `${arr[2]}`;
         logger.info(`connected to drachtio listening on ${hp}, local sip address is ${srf.locals.localSipAddress}`);
+
+        /* announce ourselves to sbc-inbound, which selects a feature server
+           from `${JAMBONES_CLUSTER_ID}:active-fs` and 480s the call if it is empty */
+        registerActiveFs(srf, logger, {clusterId: JAMBONES_CLUSTER_ID});
       });
     }
     else {
@@ -190,12 +196,10 @@ async function handle(signal) {
       }
     });
   }
-  const setName = `${(JAMBONES_CLUSTER_ID || 'default')}:active-fs`;
   const fsServiceUrlSetName = `${(JAMBONES_CLUSTER_ID || 'default')}:fs-service-url`;
-  if (setName && srf.locals.localSipAddress) {
-    logger.info(`got signal ${signal}, removing ${srf.locals.localSipAddress} from set ${setName}`);
-    removeFromSet(setName, srf.locals.localSipAddress);
-  }
+  /* stop the active-fs refresh AND deregister, in that order -- otherwise the
+     refresh timer would re-add us while we are draining in-progress calls */
+  unregisterActiveFs(srf, logger, {clusterId: JAMBONES_CLUSTER_ID});
   if (fsServiceUrlSetName && srf.locals.serviceUrl) {
     logger.info(`got signal ${signal}, removing ${srf.locals.serviceUrl} from set ${fsServiceUrlSetName}`);
     removeFromSet(fsServiceUrlSetName, srf.locals.serviceUrl);
