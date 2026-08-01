@@ -29,3 +29,34 @@ test('SIGUSR1 scale-in deregisters us from the active-fs set', async(t) => {
   t.ok(out.includes('timer=false'), 'the refresh timer stopped, so nothing re-adds us while draining');
   t.end();
 });
+
+/**
+ * The SIP half is only half the drain. api-server selects a feature server for
+ * REST-originated calls (POST /v1/Accounts/:sid/Calls) and for messaging out of
+ * `<cluster>:fs-service-url`, and like sbc-inbound it never looks at the OPTIONS
+ * ping. A drain that leaves only active-fs therefore keeps being handed new REST
+ * work for as long as the process lives, because the fs-service-url refresh timer
+ * re-asserts membership every 30s.
+ */
+test('SIGUSR1 scale-in also deregisters us from the fs-service-url set', async(t) => {
+  const {out, code} = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.join(__dirname, 'fixtures', 'drain-child.js')]);
+    let out = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('drain fixture did not exit'));
+    }, 10000);
+    child.stdout.on('data', (d) => out += d.toString());
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      resolve({out, code});
+    });
+  });
+
+  t.equal(code, 0, 'fixture exited cleanly');
+  t.ok(out.includes('svcUrlMembers=0'),
+    'we left the fs-service-url set, so api-server stops dispatching REST calls here');
+  t.ok(out.includes('svcUrlTimer=false'),
+    'the fs-service-url refresh timer stopped, so nothing re-advertises us while draining');
+  t.end();
+});

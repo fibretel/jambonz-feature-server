@@ -81,7 +81,9 @@ installSrfLocals(srf, logger, {
            calls (POST /v1/Accounts/:sid/Calls) and for messaging, and 480s with
            "no available feature servers at this time" if it is empty. This has
            to happen HERE and not in srf.on('connect') like active-fs:
-           srf.locals.serviceUrl does not exist until this listener has bound.
+           install-srf-locals seeds srf.locals.serviceUrl from config, but only
+           this listener knows the port actually bound (it walks forward on
+           EADDRINUSE), and it overwrites the seeded guess in its callback.
            Not under kubernetes: api-server's getFsUrl() short-circuits to
            K8S_FEATURE_SERVER_SERVICE_NAME and never reads the set. */
         if (!K8S) registerFsServiceUrl(srf, logger, {clusterId: JAMBONES_CLUSTER_ID});
