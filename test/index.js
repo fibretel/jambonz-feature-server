@@ -8,6 +8,7 @@ require('./active-fs-registration-test');
 require('./fs-service-url-registration-test');
 require('./shutdown-signal-test');
 require('./drain-signal-test');
+require('./redact-test');
 require('./openai-s2s-ordering-test');
 require('./hold-unhold-test');
 require('./docker_start');
